@@ -1,0 +1,9 @@
+setup.py
+/home/TeCH/core/lib/gridencoder/src/bindings.cpp
+/home/TeCH/core/lib/gridencoder/src/gridencoder.cu
+/home/dyAvatar/lib/model/gridencoder/src/bindings.cpp
+/home/dyAvatar/lib/model/gridencoder/src/gridencoder.cu
+gridencoder.egg-info/PKG-INFO
+gridencoder.egg-info/SOURCES.txt
+gridencoder.egg-info/dependency_links.txt
+gridencoder.egg-info/top_level.txt
