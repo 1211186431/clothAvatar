@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 clip_ckpts/
 lib/smplx/smplx_model
+output/
