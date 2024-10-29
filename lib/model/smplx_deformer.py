@@ -1,15 +1,7 @@
 import torch
 import torch.nn.functional as F
-import sys
-sys.path.append('/home/clothAvatar')
 from pytorch3d import ops
-
 import torch
-from pytorch3d.structures import Meshes
-from pytorch3d.ops import interpolate_face_attributes
-import pytorch3d
-import kaolin.ops.mesh as kaolin_mesh
-
 
 class SMPLXDeformer():
     def __init__(self, max_dist=0.1, K=3,):

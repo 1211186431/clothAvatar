@@ -1,0 +1,4 @@
+# https://github.com/mikedh/trimesh
+
+newmtl upper_uv
+map_Kd upper_uv.png

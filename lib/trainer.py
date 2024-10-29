@@ -8,9 +8,7 @@ import tensorboardX
 import numpy as np
 
 import time
-
 import cv2
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -18,17 +16,10 @@ import torch.distributed as dist
 from PIL import Image
 from rich.console import Console
 from torch_ema import ExponentialMovingAverage
-
-from lib.utils.chamfer import chamfer_distance
 from lib.model.annotators import HEDdetector, Cannydetector
-from lib.utils.color_utils import convert_rgb
 from lib.utils.loss_utils import *
 from lib.data.camera_utils import *
 from lib.loss.sdfloss import *
-import math 
-import sys
-sys.path.append('/home/TeCH/')
-from lib.utils.lpips import LPIPS
 
 def scale_for_lpips(image_tensor):
     return image_tensor * 2. - 1.
@@ -197,10 +188,10 @@ class Trainer(object):
             else:  # path to ckpt
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
-        if self.cfg.train.lambda_recon > 0 or self.cfg.train.lambda_normal > 0.:
-                self.lpips_model = LPIPS(net='vgg').cuda()
-                for param in self.lpips_model.parameters():
-                    param.requires_grad = False
+        # if self.cfg.train.lambda_recon > 0 or self.cfg.train.lambda_normal > 0.:
+        #         self.lpips_model = LPIPS(net='vgg').cuda()
+        #         for param in self.lpips_model.parameters():
+        #             param.requires_grad = False
         if self.cfg.guidance.controlnet_guidance_geometry:
             if self.cfg.guidance.controlnet_guidance_geometry == 'hed':
                 self.controlnet_annotator = HEDdetector()

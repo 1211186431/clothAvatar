@@ -1,0 +1,4 @@
+# https://github.com/mikedh/trimesh
+
+newmtl scan
+map_Kd scan.png

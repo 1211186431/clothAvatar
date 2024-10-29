@@ -3,7 +3,7 @@ from yacs.config import CfgNode as CN
 import numpy as np
 from lib.model.guidance import StableDiffusion
 from lib.data.provider import ViewDataset
-from lib.render.renderer import Renderer
+from lib.renderer import Renderer
 from lib.trainer import Trainer
 from lib.data.obj import Mesh
 from lib.utils.loss_utils import calculate_rgb_depth_loss,img_loss
@@ -44,7 +44,7 @@ cfg = load_config(config_path, default_path="/home/clothAvatar/configs/default.y
 
 cfg.data.part = "body"
 cfg.model.use_fleximesh = True
-cfg.model.voxel_grid_res = 200
+cfg.model.voxel_grid_res = 100
 cfg.model.use_deformer = False
 if train_model == "geometry":
     cfg.data.body_template = "/home/clothAvatar/data/template/smplx_c.obj"
