@@ -185,8 +185,8 @@ class DMTetMesh(nn.Module):
         self.set_sdf(mesh_v,mesh_f)
         import mesh_to_sdf
         sdf_tet = torch.tensor(mesh_to_sdf.mesh_to_sdf(mesh, self.tet_v.cpu().numpy()), dtype=torch.float32).to(self.device) - init_padding
-        sdf_mesh_v, sdf_mesh_f = kal.ops.conversions.marching_tetrahedra(self.tet_v.unsqueeze(0), self.tet_ind, sdf_tet.unsqueeze(0))
-        sdf_mesh_v, sdf_mesh_f = sdf_mesh_v[0], sdf_mesh_f[0]
+        # sdf_mesh_v, sdf_mesh_f = kal.ops.conversions.marching_tetrahedra(self.tet_v.unsqueeze(0), self.tet_ind, sdf_tet.unsqueeze(0))
+        # sdf_mesh_v, sdf_mesh_f = sdf_mesh_v[0], sdf_mesh_f[0]
         if self.use_explicit:
             self.sdf.data[...] = sdf_tet[...]
         else:

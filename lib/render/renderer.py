@@ -1,6 +1,4 @@
 import os
-import math
-import cv2
 import trimesh
 import numpy as np
 import random
@@ -11,16 +9,15 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 
 import nvdiffrast.torch as dr
-# import kaolin as kal
 import sys
 sys.path.append('/home/clothAvatar')
 from lib.model.network_utils import get_encoder
 from lib.data.obj import Mesh, safe_normalize
 from lib.utils.tet_utils import build_tet_grid
 from lib.model.dmtet_network import DMTetMesh
+from lib.model.flexicube_network import FlexiMesh
 from lib.model.color_network import ColorNetwork
-from lib.model.deformer.deformer import ForwardDeformer, skinning
-from lib.smpl import SMPLXServer
+from lib.deformer.def_util import deform_mesh
 from lib.utils.uv_utils import texture_padding
 
 def scale_img_nhwc(x, size, mag='bilinear', min='bilinear'):
@@ -81,26 +78,6 @@ class MLP(nn.Module):
                 x = F.relu(x, inplace=True)
         return x
 
-import pickle as pkl
-def load_smplx_data(smplx_path):
-    f = pkl.load(open(smplx_path, 'rb'), encoding='latin1')
-    betas = f['betas']
-    num_hand_pose = 12
-    smpl_params = np.zeros(99+2*num_hand_pose)
-    smpl_params[0] = 1
-    smpl_params[1:4] = f['transl']
-    smpl_params[4:7] = f['global_orient']
-    smpl_params[7:70] = f['body_pose']
-    smpl_params[70:70+num_hand_pose] = f['left_hand_pose']
-    smpl_params[70+num_hand_pose:70+2*num_hand_pose] = f['right_hand_pose']
-    smpl_params[70+2*num_hand_pose:73+2*num_hand_pose] = np.zeros(3)
-    smpl_params[73+2*num_hand_pose:76+2*num_hand_pose] = np.zeros(3)
-    smpl_params[76+2*num_hand_pose:79+2*num_hand_pose] = f['jaw_pose']
-    smpl_params[79+2*num_hand_pose:89+2*num_hand_pose] = betas
-    smpl_params[89+2*num_hand_pose:99+2*num_hand_pose] = f['expression']
-    smpl_params= torch.tensor(smpl_params).unsqueeze(0).float().cuda()
-    return smpl_params,betas,num_hand_pose
-
 class Renderer(nn.Module):
 
     def __init__(
@@ -111,38 +88,14 @@ class Renderer(nn.Module):
     ):
 
         super().__init__()
-
+        self.deform_mesh = deform_mesh(cfg=cfg)
         self.cfg = cfg
         self.min_near = cfg.model.min_near
-        
-                ## load deformer
-        smplx_path = "/home/clothAvatar/data/mesh-f00011_smplx.pkl"
-        smplx_model_path = "/home/clothAvatar/lib/smplx/smplx_model"
-        init_model = init_model = torch.load("/home/clothAvatar/data/occ_init_male.pth")
-        smplx_params,betas,num_hand_pose = load_smplx_data(smplx_path)
-        smplx_server = SMPLXServer(gender="male",
-                                betas=betas,
-                                use_pca=True,
-                                flat_hand_mean=False,       
-                                num_pca_comps=12,model_path=smplx_model_path)
-        smplx_data = smplx_server.forward(smplx_params, absolute=False)
-        self.smpl_tfs = smplx_data['smpl_tfs']
-        self.deformer = ForwardDeformer(d_out=59,model_type='smplx').to("cuda:0")
-        self.deformer.load_state_dict(init_model['deformer_state_dict'])
-        # for p in self.deformer.parameters():
-        #     p.requires_grad = False
-    
-        
-        
         if not self.cfg.use_gl:
             self.glctx = dr.RasterizeCudaContext()  # support at most 2048 resolution.
         else:
             print('building gl context')
-            # # try:
             self.glctx = dr.RasterizeGLContext()  # will crash if using GUI...
-            # except:
-            # print('Failed to initialize GLContext, use CudaContext instead...')
-            # self.glctx = dr.RasterizeCudaContext()  # support at most 2048 resolution.
         # load the template mesh, will calculate normal and texture if not provided.
         if self.cfg.model.use_color_network:
             self.texture3d = ColorNetwork(cfg=cfg, num_layers=cfg.model.color_num_layers, hidden_dim=cfg.model.color_hidden_dim, 
@@ -152,40 +105,35 @@ class Renderer(nn.Module):
         # TODO: textrue 2D
 
         if cfg.model.use_dmtet_network:
-            if cfg.model.is_part:
-                with torch.no_grad():
-                    self.body_mesh = Mesh.load_obj(cfg.data.body_template, ref_path=cfg.data.body_template, init_empty_tex=cfg.train.init_empty_tex, albedo_res=cfg.model.albedo_res, keypoints_path=cfg.data.keypoints_path, init_uv=False)
-                    self.scale_c = {
-                        'scale': self.body_mesh.scale,
-                        'resize_matrix_inv': self.body_mesh.resize_matrix_inv,
-                        'offset':self.body_mesh.offset
-                    }
-                    self.upper_mesh = Mesh.load_obj(cfg.data.upper_template, ref_path=cfg.data.upper_template, init_empty_tex=cfg.train.init_empty_tex, albedo_res=cfg.model.albedo_res, keypoints_path=cfg.data.keypoints_path, init_uv=False, scale_data=self.scale_c)
-                    self.lower_mesh = Mesh.load_obj(cfg.data.lower_template, ref_path=cfg.data.lower_template, init_empty_tex=cfg.train.init_empty_tex, albedo_res=cfg.model.albedo_res, keypoints_path=cfg.data.keypoints_path, init_uv=False, scale_data=self.scale_c)
-                    
-                    
+            with torch.no_grad():
+                self.body_mesh = Mesh.load_obj(cfg.data.body_template, ref_path=cfg.data.body_template, init_empty_tex=cfg.train.init_empty_tex, albedo_res=cfg.model.albedo_res, keypoints_path=cfg.data.keypoints_path, init_uv=False)
+                scale_c = {
+                    'scale': self.body_mesh.scale,
+                    'resize_matrix_inv': self.body_mesh.resize_matrix_inv,
+                    'offset':self.body_mesh.offset
+                }
+                self.upper_mesh = Mesh.load_obj(cfg.data.upper_template, ref_path=cfg.data.upper_template, init_empty_tex=cfg.train.init_empty_tex, albedo_res=cfg.model.albedo_res, keypoints_path=cfg.data.keypoints_path, init_uv=False, scale_data=scale_c)
+                self.lower_mesh = Mesh.load_obj(cfg.data.lower_template, ref_path=cfg.data.lower_template, init_empty_tex=cfg.train.init_empty_tex, albedo_res=cfg.model.albedo_res, keypoints_path=cfg.data.keypoints_path, init_uv=False, scale_data=scale_c)            
+                if cfg.model.use_deformer:
                     self.mesh = hasattr(self, cfg.data.part +'_mesh') and getattr(self, cfg.data.part +'_mesh')
-                    
-                    def_body = self.deforme_mesh(self.body_mesh)
-                    scale_def ={
-                        'scale': def_body.scale,
-                        'resize_matrix_inv': def_body.resize_matrix_inv,
-                        'offset':def_body.offset
-                    }
-                    self.scale_def = scale_def
+                else:
+                    self.mesh = Mesh.load_obj(cfg.data.last_model, ref_path=cfg.data.last_model, init_empty_tex=cfg.train.init_empty_tex, albedo_res=cfg.model.albedo_res, keypoints_path=cfg.data.keypoints_path, init_uv=False)
                 
-            else:
-                self.mesh = Mesh.load_obj(self.cfg.data.last_model, ref_path=self.cfg.data.last_ref_model, init_empty_tex=self.cfg.train.init_empty_tex, albedo_res=self.cfg.model.albedo_res, keypoints_path=self.cfg.data.keypoints_path, init_uv=False)
+                self.deform_mesh.scale_c = scale_c
+                self.deform_mesh.set_scale_def(self.body_mesh)
+
             # if self.mesh.keypoints is not None:
             #     self.keypoints = self.mesh.keypoints
             # else:
             #     self.keypoints = None
             self.keypoints = None
             self.marching_tets = None
-            ## 初始化四面体网格
-            tet_v, tet_ind = build_tet_grid(self.mesh, cfg)
-            self.dmtet_network = DMTetMesh(vertices=torch.tensor(tet_v, dtype=torch.float), indices=torch.tensor(tet_ind, dtype=torch.long), grid_scale=self.cfg.model.tet_grid_scale, use_explicit=cfg.model.use_explicit_tet, geo_network=cfg.model.dmtet_network, 
-                                           hash_max_res=cfg.model.geo_hash_max_res, hash_num_levels=cfg.model.geo_hash_num_levels, num_subdiv=cfg.model.tet_num_subdiv)
+            if cfg.model.use_fleximesh:
+                self.dmtet_network = FlexiMesh(device='cuda', use_explicit=cfg.model.use_explicit_tet, geo_network=cfg.model.dmtet_network, hash_max_res=cfg.model.geo_hash_max_res, hash_num_levels=cfg.model.geo_hash_num_levels, num_subdiv=cfg.model.tet_num_subdiv,voxel_grid_res=cfg.model.voxel_grid_res)
+            else:
+                tet_v, tet_ind = build_tet_grid(self.mesh, cfg)
+                self.dmtet_network = DMTetMesh(vertices=torch.tensor(tet_v, dtype=torch.float), indices=torch.tensor(tet_ind, dtype=torch.long), grid_scale=self.cfg.model.tet_grid_scale, use_explicit=cfg.model.use_explicit_tet, geo_network=cfg.model.dmtet_network, 
+                                            hash_max_res=cfg.model.geo_hash_max_res, hash_num_levels=cfg.model.geo_hash_num_levels, num_subdiv=cfg.model.tet_num_subdiv)
             if self.cfg.train.init_mesh and not self.cfg.test.test:
                 self.dmtet_network.init_mesh(self.mesh.v, self.mesh.f, self.cfg.train.init_mesh_padding)
         else:
@@ -196,6 +144,9 @@ class Renderer(nn.Module):
                 self.keypoints = None
             self.marching_tets = None
             self.dmtet_network = None
+            self.scale_def = pickle.load(open("/home/scale_def.pkl",'rb'))
+            self.scale_c = pickle.load(open("/home/scale_c.pkl",'rb'))
+        
         self.mesh.v = self.mesh.v * self.cfg.model.mesh_scale
         if cfg.train.init_texture_3d:
             self.init_texture_3d()
@@ -207,22 +158,6 @@ class Renderer(nn.Module):
             self.sdf = nn.Parameter(torch.zeros_like(self.mesh.v[..., 0]))
             self.v_offsets = nn.Parameter(torch.zeros_like(self.mesh.v))
             self.vn_offsets = nn.Parameter(torch.zeros_like(self.mesh.v))
-        
-        if self.cfg.data.can_pose_folder:
-            import glob
-            if '.obj' in self.cfg.data.can_pose_folder:
-                can_pose_objs = [self.cfg.data.can_pose_folder]
-            else:    
-                can_pose_objs = glob.glob(self.cfg.data.can_pose_folder + '/*.obj')
-            self.can_pose_vertices = []
-            self.can_pose_faces = []
-            self.can_pose_resize_inv = []
-            for pose_obj in can_pose_objs:
-                tri_mesh = trimesh.load(pose_obj)
-                mesh = Mesh(torch.tensor(tri_mesh.vertices, dtype=torch.float32).cuda(), torch.tensor(tri_mesh.faces, dtype=torch.int32).cuda())
-                mesh.auto_size()
-                self.can_pose_vertices.append(mesh.v)
-                self.can_pose_faces.append(mesh.f)
                 
         # background network
         self.encoder_bg, self.in_dim_bg = get_encoder('frequency_torch', input_dim=3, multires=4)
@@ -306,7 +241,6 @@ class Renderer(nn.Module):
 
     @torch.no_grad()
     def export_mesh(self, save_path, name='mesh', export_uv=False):
-        # self.resize_matrix_inv = self.mesh.resize_matrix_inv
         if self.dmtet_network is not None:
             num_subdiv = self.get_num_subdiv()
             with torch.no_grad():
@@ -324,7 +258,8 @@ class Renderer(nn.Module):
             self.mesh.vn = self.mesh.vn
         if export_uv:
             base_v = self.mesh.v
-            self.mesh = self.deforme_mesh(self.mesh)
+            if self.cfg.model.use_deformer:
+                self.mesh = self.deform_mesh(self.mesh)
             if self.mesh.vt is None:
                 self.mesh.auto_uv()
             if self.cfg.model.use_vertex_tex:
@@ -334,8 +269,6 @@ class Renderer(nn.Module):
             else:
                 self.mesh.albedo = self.get_albedo_from_texture3d()
         self.mesh.v = base_v
-        # verts = torch.cat([self.mesh.v, torch.ones_like(self.mesh.v[:, :1])], dim=1) @ self.resize_matrix_inv.T
-        # self.mesh.v = verts
         self.mesh.write(os.path.join(save_path, '{}.obj'.format(name)))
         if self.cfg.data.da_pose_mesh:
             import trimesh
@@ -344,25 +277,6 @@ class Renderer(nn.Module):
             self.mesh.v = verts
             self.mesh.write(os.path.join(save_path, '{}_da.obj'.format(name)))
 
-    def deforme_mesh(self,mesh,def_scale=None):
-        verts = mesh.v
-        faces = mesh.f
-        v_homogeneous = torch.cat([verts, torch.ones(verts.shape[0], 1, device="cuda:0",requires_grad=True)], dim=1)
-        restored_v = (self.scale_c['resize_matrix_inv'] @ v_homogeneous.T).T[:, :3]
-        weights = self.deformer.query_weights(restored_v[None],
-                                    None).clamp(0, 1)[0]
-        verts_mesh_deformed = skinning(restored_v.unsqueeze(0),
-                                        weights.unsqueeze(0),
-                                        self.smpl_tfs)
-        verts = verts_mesh_deformed[0].float()
-        if def_scale is None:
-            mesh = Mesh(v=verts,f=faces)
-            mesh.auto_size()
-        else:
-            mesh = Mesh(v=verts,f=faces)
-            mesh.auto_size_by_body(def_scale)
-        mesh.auto_normal()
-        return mesh
         
     @torch.no_grad()
     def get_albedo_from_texture3d(self):
@@ -421,9 +335,9 @@ class Renderer(nn.Module):
         mesh.auto_normal()
         return mesh, loss
     
-    def get_color_from_vertex_texture(self, rast, rast_db, f, light_d, ambient_ratio, shading) -> Tensor:
+    def get_color_from_vertex_texture(self, rast, rast_db, f, light_d, ambient_ratio, shading,mesh=None) -> Tensor:
         albedo, _ = dr.interpolate(
-            self.vertex_albedo.unsqueeze(0).contiguous(), rast, f, rast_db=rast_db)
+            mesh.v_color.unsqueeze(0).contiguous(), rast, f, rast_db=rast_db)
         albedo = albedo.clamp(0., 1.)
         albedo = torch.where(rast[..., 3:] > 0, albedo, torch.tensor(0.).to(albedo.device))  # remove background
 
@@ -469,7 +383,7 @@ class Renderer(nn.Module):
         return color
    
    
-    ## 渲染uv
+    ## 渲染uv，加了sigmoid会变浅
     def get_color_from_2d_texture(self, rast, rast_db, mesh, rays_o, light_d, ambient_ratio, shading) -> Tensor:
         texc, texc_db = dr.interpolate(
             mesh.vt.unsqueeze(0).contiguous(), rast, mesh.ft, rast_db=rast_db, diff_attrs='all')
@@ -477,7 +391,7 @@ class Renderer(nn.Module):
             mesh.albedo.unsqueeze(0), texc, uv_da=texc_db, filter_mode='linear-mipmap-linear')  # [1, H, W, 3]
         # texc, _ = dr.interpolate(self.mesh.vt.unsqueeze(0).contiguous(), rast, self.mesh.ft)
         # albedo = dr.texture(self.albedo.unsqueeze(0), texc, filter_mode='linear') # [1, H, W, 3]
-        albedo = torch.sigmoid(albedo)
+        # albedo = torch.sigmoid(albedo)
         albedo = torch.where(rast[..., 3:] > 0, albedo, torch.tensor(0).to(albedo.device))  # remove background
 
         if shading == 'albedo':
@@ -565,7 +479,7 @@ class Renderer(nn.Module):
         return self.cfg.model.tet_num_subdiv
 
 
-    def forward(self, rays_o, rays_d, mvp, h0, w0, light_d=None, ref_rgb=None, ambient_ratio=1.0, shading='albedo', return_loss=False, alpha_only=False, detach_geo=False, albedo_ref=False, poses=None, return_openpose_map=False, global_step=1e7, return_can_pos_map=False, mesh=None, can_pose=False,need_deform=False,is_gt=False):
+    def forward(self, rays_o, rays_d, mvp, h0, w0, light_d=None, ref_rgb=None, ambient_ratio=1.0, shading='albedo', return_loss=False, alpha_only=False, detach_geo=False, albedo_ref=False, poses=None, return_openpose_map=False, global_step=1e7, return_can_pos_map=False, mesh=None, can_pose=False,use_deformer=False,is_gt=False):
         # mvp: [1, 4, 4]
         mvp = mvp.squeeze()
         device = mvp.device
@@ -605,10 +519,10 @@ class Renderer(nn.Module):
         geo_reg_loss = None
         if mesh is None:
             mesh, geo_reg_loss = self.get_mesh(return_loss=return_loss, detach_geo=detach_geo, global_step=global_step)
-        if need_deform:
+        if use_deformer:
             can_mesh = mesh
             results['can_mesh'] = can_mesh
-            mesh = self.deforme_mesh(mesh,def_scale=self.scale_def)
+            mesh = self.deform_mesh(mesh,def_scale=True)
         results['mesh'] = mesh
         v = mesh.v  # [N, 3]
         f = mesh.f
@@ -626,14 +540,6 @@ class Renderer(nn.Module):
             if self.cfg.model.render_ssaa > 1:
                 alpha = scale_img_hwc(alpha, (h0, w0))
             return dict(alpha=alpha)
-        # xyzs, _ = dr.interpolate(v.unsqueeze(0), rast, self.mesh.f) # [1, H, W, 3]
-        # xyzs = xyzs.view(-1, 3)
-        # mask = (mask > 0).view(-1)
-        # albedo = torch.zeros_like(xyzs, dtype=torch.float32)
-        # if mask.any():
-        #     masked_albedo = torch.sigmoid(self.color_net(self.encoder(xyzs[mask].detach(), bound=1)))
-        #     albedo[mask] = masked_albedo.float()
-        # albedo = albedo.view(1, h, w, 3)cuda
         if not self.cfg.model.use_can_pose_space:
             color_space_v, color_space_f = mesh.v, mesh.f
         else:
@@ -650,7 +556,7 @@ class Renderer(nn.Module):
         elif self.cfg.model.use_texture_2d or is_gt:
             color = self.get_color_from_2d_texture(rast, rast_db, mesh, rays_o, light_d, ambient_ratio, shading)
         elif self.cfg.model.use_vertex_tex:
-            color = self.get_color_from_vertex_texture(rast, rast_db, color_space_f, light_d, ambient_ratio, shading)
+            color = self.get_color_from_vertex_texture(rast, rast_db, color_space_f, light_d, ambient_ratio, shading,mesh=mesh)
         else:
             color = self.get_color_from_3d_texture(rast, rast_db, color_space_v, color_space_f, mesh.vn, light_d, ambient_ratio, shading)
         color = color.float()

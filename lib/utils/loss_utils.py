@@ -2,7 +2,8 @@
 import torch
 import torch.nn.functional as F
 from scipy.ndimage import distance_transform_edt
-
+import torch.nn as nn
+import torchvision.models as models
 def crop_by_mask(rgb, alpha, base_size=64):
     mask = (alpha[0,0] > 0).float()
     h, w = mask.shape
@@ -170,3 +171,98 @@ def laplacian_smooth_loss(v_pos, t_pos_idx):
     term = term / torch.clamp(norm, min=1.0)
 
     return torch.mean(term ** 2)
+
+
+
+# 定义下采样函数
+def downsample_image(image, scale_factor):
+    """
+    使用双线性插值对图像进行下采样。
+    Args:
+        image (torch.Tensor): 输入图像张量，形状为 (batch_size, channels, height, width)。
+        scale_factor (float): 缩放因子，<1 表示下采样。
+
+    Returns:
+        torch.Tensor: 下采样后的图像张量。
+    """
+    return F.interpolate(image, scale_factor=scale_factor, mode='bilinear', align_corners=False)
+
+class PerceptualLoss(nn.Module):
+    def __init__(self):
+        super(PerceptualLoss, self).__init__()
+        vgg = models.vgg16(pretrained=True).features
+        self.features = nn.Sequential(*list(vgg[:23])).eval().to('cuda:0')
+        for param in self.features.parameters():
+            param.requires_grad = False
+
+    def forward(self, x, y):
+        x_vgg = self.features(x)
+        y_vgg = self.features(y)
+        loss = torch.mean((x_vgg - y_vgg) ** 2)
+        return loss
+
+perceptualloss = PerceptualLoss()
+
+def gaussian_window(size, sigma):
+    coords = torch.arange(size, dtype=torch.float32) - size // 2
+    grid = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    grid /= grid.sum()
+    return grid.reshape(1, 1, size, 1) * grid.reshape(1, 1, 1, size)
+
+def ssim(x, y, window_size=11, sigma=1.5, C1=0.01**2, C2=0.03**2, size_average=True):
+    window = gaussian_window(window_size, sigma).to(x.device)
+    
+    mu_x = F.conv2d(x, window, padding=window_size//2, groups=x.shape[1])
+    mu_y = F.conv2d(y, window, padding=window_size//2, groups=y.shape[1])
+    
+    sigma_x = F.conv2d(x**2, window, padding=window_size//2, groups=x.shape[1]) - mu_x**2
+    sigma_y = F.conv2d(y**2, window, padding=window_size//2, groups=y.shape[1]) - mu_y**2
+    sigma_xy = F.conv2d(x*y, window, padding=window_size//2, groups=x.shape[1]) - mu_x*mu_y
+    
+    ssim_map = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / ((mu_x**2 + mu_y**2 + C1) * (sigma_x + sigma_y + C2))
+    
+    if size_average:
+        return ssim_map.mean()
+    else:
+        return ssim_map.mean(1).mean(1).mean(1)  # returns a batch of SSIM scores
+def img_loss(pred_img, gt_img):
+    l2_loss = F.mse_loss(pred_img, gt_img)
+    l1_loss = F.l1_loss(pred_img, gt_img)
+    x = pred_img
+    y = gt_img
+    ssim_r = ssim(x[:, 0:1, :, :], y[:, 0:1, :, :])
+    ssim_g = ssim(x[:, 1:2, :, :], y[:, 1:2, :, :])
+    ssim_b = ssim(x[:, 2:3, :, :], y[:, 2:3, :, :])
+
+    # Average SSIM over all channels
+    ssim_avg = (ssim_r + ssim_g + ssim_b) / 3
+    perceptual_loss = perceptualloss(x, y)
+    loss = 100*l1_loss+(1-ssim_avg)*50 + 5*perceptual_loss
+    # loss = l1_loss+(1-ssim_avg)*1 + perceptual_loss
+    return loss
+
+
+def calculate_rgb_depth_loss(pred_rgb, pred_depth, pred_rgb_gt, pred_depth_gt, rgb_weight=0.5, depth_weight=0.5):
+    """
+    Inputs:
+        pred_rgb: Bx3xHxW Tensor, predicted RGB image
+        pred_depth: Bx1xHxW Tensor, predicted depth map
+        pred_rgb_gt: Bx3xHxW Tensor, ground truth RGB image
+        pred_depth_gt: Bx1xHxW Tensor, ground truth depth map
+        rgb_weight: weight for the RGB loss
+        depth_weight: weight for the depth loss
+    Output:
+        loss: combined loss for RGB and depth
+    """
+    # RGB loss (L2 loss)
+    rgb_loss = (pred_rgb - pred_rgb_gt) ** 2
+    rgb_loss = rgb_loss.sum()
+
+    # Depth loss (L2 loss)
+    depth_loss = (pred_depth - pred_depth_gt) ** 2
+    depth_loss = depth_loss.sum()
+
+    # Weighted sum of RGB and depth losses
+    total_loss = rgb_loss * rgb_weight + depth_loss * depth_weight
+    
+    return total_loss

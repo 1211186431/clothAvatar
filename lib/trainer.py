@@ -388,7 +388,7 @@ class Trainer(object):
     ### ------------------------------
 
 
-    def render_image(self,data,mesh,ambient_ratio,shading,need_deform=False,is_gt=False):
+    def render_image(self,data,mesh,ambient_ratio,shading,use_deformer=False,is_gt=False):
         mvp = data['mvp']
         poses = data['poses']
         H, W = data['H'], data['W']
@@ -403,7 +403,7 @@ class Trainer(object):
                             return_openpose_map=self.render_openpose_training,
                             global_step=self.global_step,
                             can_pose=data['can_pose'],
-                            mesh=mesh,need_deform=need_deform,is_gt=is_gt)
+                            mesh=mesh,use_deformer=use_deformer,is_gt=is_gt)
         pred_rgb = outputs['image'].reshape(1, H, W, 3).permute(0, 3, 1, 2).contiguous()  # [1, 3, H, W]
         pred_alpha = outputs['alpha'].reshape(1, H, W, 1).permute(0, 3, 1, 2).contiguous()  # [1, 1, H, W]
         pred_depth = outputs['depth'].reshape(1, H, W)
@@ -434,21 +434,28 @@ class Trainer(object):
         step_mesh = None
         
         for i_shading, shading in enumerate(shadings):
-            pred_rgb, pred_alpha, pred_depth,outputs = self.render_image(data,step_mesh,ambient_ratio,shading,need_deform=True)
+            pred_rgb, pred_alpha, pred_depth,outputs = self.render_image(data,step_mesh,ambient_ratio,shading,use_deformer=self.cfg.model.use_deformer)
             if gt_mesh is not None:
                 pred_rgb_gt, pred_alpha_gt, pred_depth_gt,outputs_gt = self.render_image(data,gt_mesh,ambient_ratio,shading,is_gt=True)
             if step_mesh is None:
                 step_mesh = outputs['mesh']                                     
             # regularizations
             # smoothness
-            mesh = outputs['mesh']
-            can_mesh = outputs['can_mesh']
+            out_mesh = outputs['mesh']
+            if self.cfg.model.use_deformer:
+                mesh = outputs['mesh']
+                can_mesh = outputs['can_mesh']
+            else:
+                mesh = outputs['mesh']
+                can_mesh = None
+            # geo_reg_loss = outputs['geo_reg_loss']
+            # loss = loss + geo_reg_loss*100
             if i_shading == 0:
                 if flag_train_geometry and self.cfg.train.lambda_lap > 0:
-                    loss_lap = laplacian_smooth_loss(can_mesh.v, can_mesh.f.long())
+                    loss_lap = laplacian_smooth_loss(mesh.v, mesh.f.long())
                     loss = loss + self.cfg.train.lambda_lap * loss_lap
 
-        return pred_rgb, pred_depth, loss,pred_rgb_gt, pred_depth_gt,mesh,can_mesh
+        return pred_rgb, pred_depth, loss,pred_rgb_gt, pred_depth_gt,out_mesh,can_mesh
 
     def eval_step(self, data, no_resize=True):
 
